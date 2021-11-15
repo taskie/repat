@@ -2,9 +2,10 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
+    process::{exit, Command},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::debug;
 use regex::Regex;
 use similar::TextDiff;
@@ -14,6 +15,18 @@ use structopt::StructOpt;
 #[structopt(name = "repat", about = "Creates patch to replace words using RegEx.")]
 #[structopt(long_version(option_env!("LONG_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))))]
 struct Opt {
+    #[structopt(short, long)]
+    rg: bool,
+
+    #[structopt(short = "s", long)]
+    searcher: Option<String>,
+
+    #[structopt(short = "S", long)]
+    searcher_flags: Option<String>,
+
+    #[structopt(short = "0", long)]
+    null: Option<bool>,
+
     #[structopt(name = "PATTERN")]
     pattern: Regex,
 
@@ -22,6 +35,32 @@ struct Opt {
 
     #[structopt(name = "FILE")]
     files: Vec<PathBuf>,
+}
+
+fn exec_searcher(
+    opt: &Opt,
+    searcher: &str,
+    searcher_flags: &[String],
+    null: bool,
+) -> Result<Vec<PathBuf>> {
+    let command = Command::new(&searcher)
+        .args(searcher_flags)
+        .arg(opt.pattern.as_str())
+        .output()?;
+    debug!("{:?}", command);
+    if !command.status.success() {
+        exit(1);
+    }
+    let delimiter = if null { '\0' } else { '\n' };
+    let files = command.stdout.split(|b| *b as char == delimiter);
+    let files: Result<Vec<String>> = files
+        .map(|bs| String::from_utf8(bs.to_vec()).context("not UTF-8"))
+        .collect();
+    Ok(files?
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.into())
+        .collect())
 }
 
 fn replace<R: BufRead, W: Write>(opt: &Opt, mut bufr: R, w: W, file_path: &Path) -> Result<()> {
@@ -41,15 +80,25 @@ fn main() -> Result<()> {
     env_logger::init();
     let opt = Opt::from_args();
     debug!("{:?}", opt);
-    let files = if opt.files.is_empty() {
-        vec![PathBuf::from("-")]
-    } else {
-        opt.files.clone()
+    let mut files = opt.files.clone();
+    if opt.rg || opt.searcher.is_some() {
+        let searcher = opt.searcher.clone().unwrap_or_else(|| "rg".to_string());
+        let searcher_flags = if let Some(flags) = opt.searcher_flags.clone() {
+            flags.split(' ').map(|s| s.to_owned()).collect()
+        } else {
+            vec!["-0l".to_owned()]
+        };
+        let null = opt.null.unwrap_or(true);
+        files.extend(exec_searcher(&opt, &searcher, &searcher_flags, null)?);
     };
+    if files.is_empty() {
+        files.push(PathBuf::from("-"));
+    }
     let stdout = io::stdout();
     let stdout_lock = stdout.lock();
     let mut bufw = BufWriter::new(stdout_lock);
     for file_path in files.iter() {
+        debug!("{:?}", file_path);
         if file_path.to_str() == Some("-") {
             let stdin = io::stdin();
             let stdin_lock = stdin.lock();
